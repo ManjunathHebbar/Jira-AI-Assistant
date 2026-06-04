@@ -13,14 +13,14 @@ An AI-powered Jira automation platform that automatically:
 
 Built using:
 
-- Python
-- FastAPI
-- Ollama
-- SQLite
-- ChromaDB
-- Sentence Transformers
-- Jira REST API
-- ngrok
+- Python — core backend language for Jira processing, AI orchestration, and KB ingestion
+- FastAPI — exposes the `/jira-webhook` endpoint that Jira Automation calls
+- Ollama — runs the local LLM used for summaries, translation, sentiment, and root-cause analysis
+- SQLite — stores processed ticket hashes and processing locks to prevent duplicate webhook loops
+- ChromaDB — local vector database for retrieving relevant knowledge base entries
+- Sentence Transformers — converts KB documents and ticket text into embeddings for similarity search
+- Jira REST API — fetches Jira issue details and updates the AI custom field
+- ngrok — exposes the local FastAPI server to Jira Cloud during development/testing
 
 ---
 
@@ -150,7 +150,7 @@ Perfect for:
 ```text
 Jira Ticket Updated
         ↓
-Jira Automation Rule
+Jira Native Webhook or Jira Automation Rule
         ↓
 Webhook hits FastAPI
         ↓
@@ -160,6 +160,7 @@ Extract:
    - Summary
    - Description
    - Comments
+   - Status
         ↓
 Knowledge Base Retrieval (RAG from ChromaDB)
         ↓
@@ -171,7 +172,9 @@ Ollama generates:
         ↓
 Update Jira Custom Field
         ↓
-Store Hash in SQLite after successful Jira update
+If resolved, save useful ticket learning into ChromaDB
+        ↓
+Store Hash in SQLite after successful Jira and KB updates
 ```
 
 ---
@@ -195,6 +198,7 @@ Jira-api/
 │   │   └── sqlite_cache.py
 │   │
 │   ├── jira/
+│   │   ├── adf_builder.py
 │   │   ├── fetcher.py
 │   │   └── updater.py
 │   │
@@ -214,9 +218,12 @@ Jira-api/
 │   ├── docs/
 │   │   ├── login_issue.txt
 │   │   └── payment_issue.txt
+│   ├── resolved_snapshots/
 │   ├── jira_kb.txt
 │   ├── build_index.py
 │   ├── ingest.py
+│   ├── kb_updater.py
+│   ├── root_cause_analyzer.py
 │   └── vector_store.py
 │
 ├── chroma_db/
@@ -383,6 +390,8 @@ PROJECT_KEY=MS
 CUSTOM_FIELD_ID=customfield_10119
 
 OLLAMA_MODEL=mistral
+
+OLLAMA_URL=http://localhost:11434/api/generate
 ```
 
 The app also accepts `JIRA_EMAIL` and `JIRA_API_TOKEN` as aliases for `EMAIL` and `API_TOKEN`.
@@ -417,6 +426,8 @@ Expected:
 Knowledge Base Ingested Successfully
 Collection: jira_knowledge
 ```
+
+This indexes the static knowledge base documents into ChromaDB. Resolved Jira tickets are added automatically at runtime by `knowledge_base/kb_updater.py`.
 
 ---
 
@@ -464,11 +475,54 @@ Copy the HTTPS URL.
 
 ---
 
-# ⚙️ Jira Automation Setup
+# ⚙️ Jira Webhook Setup
 
 ---
 
-# Create Jira Automation Rule
+# Option 1 — Jira Native Webhook
+
+Open:
+
+```text
+Jira Settings → System → Webhooks
+```
+
+Create a webhook with:
+
+```text
+URL:
+https://YOUR_NGROK_URL.ngrok-free.dev/jira-webhook
+
+Events:
+- Issue updated
+
+JQL:
+project = MS
+```
+
+Native webhooks send the full Jira payload. The app reads the issue key from the `issue.key` field and then fetches the latest Jira issue details through the Jira REST API.
+
+The AI summary still updates for normal issue changes like title, description, comments, or status.
+
+Knowledge base saving only happens when the native webhook changelog shows the issue status changed to a Done-like status:
+
+```text
+Done
+Closed
+Resolved
+Complete
+Completed
+```
+
+Other issue updates still refresh the AI field, but skip KB saving with:
+
+```text
+TICKET RESOLVED BUT STATUS DID NOT JUST CHANGE TO DONE - skipping KB save
+```
+
+---
+
+# Option 2 — Jira Automation Rule
 
 Open:
 
@@ -476,49 +530,35 @@ Open:
 Project Settings → Automation
 ```
 
----
-
-# Trigger
+Trigger:
 
 ```text
 Issue Updated
 ```
 
----
-
-# Action
+Action:
 
 ```text
 Send Web Request
 ```
 
----
-
-# URL
+URL:
 
 ```text
 https://YOUR_NGROK_URL.ngrok-free.dev/jira-webhook
 ```
 
----
-
-# HTTP Method
+HTTP Method:
 
 ```text
 POST
 ```
 
----
-
-# Headers
+Headers:
 
 | Key | Value |
 |------|------|
 | Content-Type | application/json |
-
----
-
-# Request Body
 
 Choose:
 
@@ -535,6 +575,8 @@ Paste:
   }
 }
 ```
+
+Both setup options use the same FastAPI endpoint. Native Jira webhook events outside issue updates are ignored safely.
 
 ---
 
@@ -591,6 +633,28 @@ Collection: jira_knowledge
 ```bash
 python3 -m uvicorn app.main:app --reload
 ```
+
+---
+
+# ✅ Automatic KB Updates from Resolved Tickets
+
+When Jira sends a webhook for a resolved ticket, the app can save that ticket as reusable knowledge.
+
+Runtime flow:
+
+1. `app/main.py` fetches the Jira issue and reads the status.
+2. If the status is resolved/done/closed, it calls `knowledge_base/kb_updater.py`.
+3. `kb_updater.py` checks whether the ticket has useful summary/root-cause/fix content.
+4. It redacts sensitive values and avoids near-duplicate KB entries.
+5. It writes a review snapshot to `knowledge_base/resolved_snapshots/`.
+6. It upserts the final text into ChromaDB as embeddings in the `jira_knowledge` collection.
+
+Important:
+
+- `resolved_snapshots/` is only for human review.
+- The actual searchable KB entry is stored in ChromaDB.
+- `knowledge_base/ingest.py` is only needed when static KB files change.
+- Status is included in the processed-ticket hash, so moving a ticket to Done can trigger the KB update even when the summary/description/comments did not change.
 
 ---
 
@@ -668,11 +732,21 @@ Die Datenbankverbindung schlägt fehl.
 
 - Jira API fetch/update calls use a 30 second timeout.
 - Failed Jira fetch/update responses raise clear errors.
-- The processed-ticket hash is saved only after Jira update succeeds.
+- The AI custom field is updated with temporary processing states while work is running.
+- Processing states use Jira ADF panels, headings, and progress bullets.
+- The temporary processing state is replaced by the final AI summary when generation completes.
+- If generation fails after the ticket is claimed, the custom field is updated with a failed state.
+- The processed-ticket hash is saved only after the final Jira update succeeds.
+- For resolved tickets, the hash is saved only after the KB update succeeds too.
+- If a resolved-ticket KB update fails, the processing lock is cleared so Jira can retry later.
 - Duplicate webhook processing is prevented with SQLite processing locks.
 - Stale processing locks expire after 30 minutes so interrupted work can retry.
-- Blocking Jira, Ollama, ChromaDB, and SQLite work runs in FastAPI's threadpool.
+- Blocking Jira, Ollama, ChromaDB, and SQLite work runs in FastAPI's threadpool using `run_in_threadpool`.
 - Runtime cache is stored at `cache/processed_tickets.db`.
+
+Why `run_in_threadpool` is used:
+
+FastAPI endpoints are async, but this project uses blocking libraries for Jira REST calls, Ollama calls, ChromaDB access, and SQLite cache writes. `run_in_threadpool` moves that blocking work off the main event loop, so the API can still accept other webhook requests while one ticket is being processed.
 
 ---
 

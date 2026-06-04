@@ -1,5 +1,9 @@
 def extract_text(node):
 
+    if isinstance(node, str):
+
+        return node.strip()
+
     text = ""
 
     if isinstance(node, dict):
