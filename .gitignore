@@ -154,3 +154,5 @@ sentence_transformers/
 # =========================
 
 .huggingface/
+
+knowledge_base/resolved_snapshots/

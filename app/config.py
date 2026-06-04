@@ -10,6 +10,7 @@ PROJECT_KEY = os.getenv("PROJECT_KEY")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", 50))
 CUSTOM_FIELD_ID = os.getenv("CUSTOM_FIELD_ID")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 
 
 def require_settings(*settings):
