@@ -28,12 +28,31 @@ from app.jira.adf_builder import (
     build_processing_adf
 )
 
+from app.config import CUSTOM_FIELD_ID
+
 from knowledge_base.root_cause_analyzer import analyze_root_cause
 from knowledge_base.kb_updater import is_ticket_resolved, save_ticket_to_knowledge_base
 
 app = FastAPI()
 
 initialize_database()
+
+SUPPORTED_NATIVE_WEBHOOK_EVENTS = {
+    "jira:issue_created",
+    "jira:issue_updated",
+    "issue_created",
+    "issue_updated",
+    "comment_created",
+    "comment_updated"
+}
+
+DONE_STATUS_NAMES = {
+    "done",
+    "closed",
+    "resolved",
+    "complete",
+    "completed"
+}
 
 
 @app.get("/")
@@ -58,6 +77,124 @@ async def update_processing_state(
             completed_steps=completed_steps
         )
     )
+
+
+def get_issue_key_from_webhook_payload(payload):
+    """
+    Supports both Jira native webhooks and Jira Automation custom payloads.
+    Native webhooks include a full `issue` object; Automation may send only
+    {"issue": {"key": "MS-13"}}.
+    """
+
+    if not isinstance(payload, dict):
+
+        return None
+
+    issue_data = payload.get("issue")
+
+    if isinstance(issue_data, dict) and issue_data.get("key"):
+
+        return issue_data.get("key")
+
+    issue_key = payload.get("issueKey") or payload.get("issue_key")
+
+    if issue_key:
+
+        return issue_key
+
+    return None
+
+
+def should_handle_webhook_event(payload):
+    """
+    Jira native webhooks include `webhookEvent`. Automation payloads usually do
+    not, so payloads without this field are treated as supported.
+    """
+
+    webhook_event = payload.get("webhookEvent")
+
+    if not webhook_event:
+
+        return True
+
+    return webhook_event in SUPPORTED_NATIVE_WEBHOOK_EVENTS
+
+
+def get_changed_fields(payload):
+    """Returns changed Jira field names/ids from native webhook changelog."""
+
+    changelog = payload.get("changelog", {})
+
+    items = changelog.get("items", [])
+
+    changed_fields = []
+
+    for item in items:
+
+        changed_fields.append(
+            item.get("fieldId") or item.get("field") or "unknown"
+        )
+
+    return changed_fields
+
+
+def is_ai_field_only_webhook(payload):
+    """
+    Native Jira webhooks include changelog items. When our app updates only the
+    AI custom field, Jira sends another webhook; ignore that self-trigger early.
+    """
+
+    if not CUSTOM_FIELD_ID:
+
+        return False
+
+    changelog = payload.get("changelog", {})
+
+    items = changelog.get("items", [])
+
+    if not items:
+
+        return False
+
+    return all(
+        item.get("fieldId") == CUSTOM_FIELD_ID
+        for item in items
+    )
+
+
+def is_status_changed_to_done(payload):
+    """
+    Returns True only when Jira changelog shows the status field moved to a
+    Done-like status. Custom payloads without changelog are allowed for manual
+    testing or Jira Automation rules that already filter the transition.
+    """
+
+    changelog = payload.get("changelog", {})
+
+    items = changelog.get("items", [])
+
+    if not items:
+
+        return True
+
+    for item in items:
+
+        field_name = str(item.get("field") or "").lower()
+        field_id = str(item.get("fieldId") or "").lower()
+
+        if field_name != "status" and field_id != "status":
+
+            continue
+
+        new_status = str(
+            item.get("toString") or item.get("to") or ""
+        ).lower().strip()
+
+        if new_status in DONE_STATUS_NAMES:
+
+            return True
+
+    return False
 
 
 @app.post("/jira-webhook")
@@ -99,23 +236,33 @@ async def jira_webhook(request: Request):
                 "reason": "invalid json"
             }
 
-        print(payload)
+        print("WEBHOOK EVENT:", payload.get("webhookEvent", "automation/custom"))
+        print("ISSUE KEY:", get_issue_key_from_webhook_payload(payload))
+        print("CHANGED FIELDS:", get_changed_fields(payload) or "not provided")
 
-        issue_data = payload.get("issue")
+        if is_ai_field_only_webhook(payload):
 
-        if not issue_data:
+            print("\nSKIPPING - AI FIELD SELF-UPDATE")
 
             return {
-                "status": "failed",
-                "error": "No issue found in payload"
+                "status": "ignored",
+                "reason": "ai field self-update"
             }
 
-        issue_key = issue_data.get("key")
+        if not should_handle_webhook_event(payload):
+
+            return {
+                "status": "ignored",
+                "reason": "unsupported webhook event",
+                "event": payload.get("webhookEvent")
+            }
+
+        issue_key = get_issue_key_from_webhook_payload(payload)
 
         if not issue_key:
 
             return {
-                "status": "failed",
+                "status": "ignored",
                 "error": "No issue key found in payload"
             }
 
@@ -286,7 +433,9 @@ async def jira_webhook(request: Request):
 
         kb_saved = False
 
-        if ticket_resolved:
+        status_changed_to_done = is_status_changed_to_done(payload)
+
+        if ticket_resolved and status_changed_to_done:
 
             print(f"\nTICKET IS RESOLVED - saving to knowledge base...")
 
@@ -303,13 +452,19 @@ async def jira_webhook(request: Request):
                 sentiment
             )
 
+        elif ticket_resolved:
+
+            print(
+                "\nTICKET RESOLVED BUT STATUS DID NOT JUST CHANGE TO DONE - skipping KB save"
+            )
+
         else:
 
             print(
                 "\nTICKET NOT RESOLVED - skipping KB save"
             )
 
-        if ticket_resolved and not kb_saved:
+        if ticket_resolved and status_changed_to_done and not kb_saved:
 
             await run_in_threadpool(
                 clear_processing_ticket,

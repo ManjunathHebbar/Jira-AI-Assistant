@@ -150,7 +150,7 @@ Perfect for:
 ```text
 Jira Ticket Updated
         ↓
-Jira Automation Rule
+Jira Native Webhook or Jira Automation Rule
         ↓
 Webhook hits FastAPI
         ↓
@@ -475,11 +475,54 @@ Copy the HTTPS URL.
 
 ---
 
-# ⚙️ Jira Automation Setup
+# ⚙️ Jira Webhook Setup
 
 ---
 
-# Create Jira Automation Rule
+# Option 1 — Jira Native Webhook
+
+Open:
+
+```text
+Jira Settings → System → Webhooks
+```
+
+Create a webhook with:
+
+```text
+URL:
+https://YOUR_NGROK_URL.ngrok-free.dev/jira-webhook
+
+Events:
+- Issue updated
+
+JQL:
+project = MS
+```
+
+Native webhooks send the full Jira payload. The app reads the issue key from the `issue.key` field and then fetches the latest Jira issue details through the Jira REST API.
+
+The AI summary still updates for normal issue changes like title, description, comments, or status.
+
+Knowledge base saving only happens when the native webhook changelog shows the issue status changed to a Done-like status:
+
+```text
+Done
+Closed
+Resolved
+Complete
+Completed
+```
+
+Other issue updates still refresh the AI field, but skip KB saving with:
+
+```text
+TICKET RESOLVED BUT STATUS DID NOT JUST CHANGE TO DONE - skipping KB save
+```
+
+---
+
+# Option 2 — Jira Automation Rule
 
 Open:
 
@@ -487,49 +530,35 @@ Open:
 Project Settings → Automation
 ```
 
----
-
-# Trigger
+Trigger:
 
 ```text
 Issue Updated
 ```
 
----
-
-# Action
+Action:
 
 ```text
 Send Web Request
 ```
 
----
-
-# URL
+URL:
 
 ```text
 https://YOUR_NGROK_URL.ngrok-free.dev/jira-webhook
 ```
 
----
-
-# HTTP Method
+HTTP Method:
 
 ```text
 POST
 ```
 
----
-
-# Headers
+Headers:
 
 | Key | Value |
 |------|------|
 | Content-Type | application/json |
-
----
-
-# Request Body
 
 Choose:
 
@@ -546,6 +575,8 @@ Paste:
   }
 }
 ```
+
+Both setup options use the same FastAPI endpoint. Native Jira webhook events outside issue updates are ignored safely.
 
 ---
 
